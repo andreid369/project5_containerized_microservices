@@ -1,0 +1,20 @@
+# Keep the build context small and keep secrets and local state out of the image.
+.git
+.github
+.gitignore
+.env
+.env.*
+!.env.example
+node_modules
+npm-debug.log*
+coverage
+cloudformation
+scripts
+ecs
+docs
+*.md
+docker-compose.yml
+buildspec.yml
+appspec.yaml
+Dockerfile
+.dockerignore

@@ -1,0 +1,30 @@
+# Local development: PostgreSQL plus the service, built from the same Dockerfile
+# that runs on ECS.
+#   docker compose up --build
+#   curl http://localhost:3000/products
+services:
+  db:
+    image: public.ecr.aws/docker/library/postgres:18-alpine
+    environment:
+      POSTGRES_DB: products
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: local-dev-only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d products"]
+      interval: 5s
+      retries: 10
+
+  app:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      DB_HOST: db
+      DB_NAME: products
+      DB_USER: postgres
+      DB_PASSWORD: local-dev-only
+      DB_SSL: "false"
+    read_only: true
+    depends_on:
+      db:
+        condition: service_healthy

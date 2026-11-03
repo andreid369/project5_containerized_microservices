@@ -1,0 +1,62 @@
+# CodeBuild: test, build and push the Product Service image, then produce the
+# three files the CodeDeployToECS action needs:
+#   imageDetail.json  the new image URI (fills <IMAGE1_NAME> in taskdef.json)
+#   taskdef.json      the task definition to register (from ecs/taskdef.json)
+#   appspec.yaml      what CodeDeploy deploys, including the capacity provider
+#                     strategy (from ecs/appspec.yaml; <TASK_DEFINITION> is
+#                     filled in by CodePipeline)
+#
+# Environment variables REPOSITORY_URI, REPOSITORY_NAME, EXECUTION_ROLE_ARN,
+# TASK_ROLE_ARN, LOG_GROUP, DB_HOST, DB_PORT, DB_SECRET_ARN and
+# CAPACITY_PROVIDER_STRATEGY_JSON are set on the CodeBuild project by
+# CloudFormation. None of them is a credential. AWS_REGION and CODEBUILD_RESOLVED_SOURCE_VERSION are set by
+# CodeBuild.
+version: 0.2
+
+env:
+  shell: bash
+  variables:
+    DOCKER_BUILDKIT: "1"
+
+phases:
+  pre_build:
+    on-failure: ABORT
+    commands:
+      - echo "Logging in to Amazon ECR"
+      - aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "${REPOSITORY_URI%%/*}"
+      # Tag = first 12 characters of the commit SHA: every image traces back to a commit.
+      - IMAGE_TAG="$(echo "$CODEBUILD_RESOLVED_SOURCE_VERSION" | cut -c1-12)"
+      - IMAGE_URI="$REPOSITORY_URI:$IMAGE_TAG"
+      - echo "Image will be $IMAGE_URI"
+
+  build:
+    on-failure: ABORT
+    commands:
+      # Tags are immutable, so a retried pipeline run for the same commit must
+      # not try to push again: reuse the image that is already there.
+      - |
+        if aws ecr describe-images --repository-name "$REPOSITORY_NAME" --image-ids imageTag="$IMAGE_TAG" >/dev/null 2>&1; then
+          echo "Image $IMAGE_URI already in ECR, skipping build and push"
+          SKIP_PUSH=1
+        else
+          echo "Running the test suite in the test stage"
+          docker build --target test -t product-service:test .
+          echo "Building the runtime image"
+          docker build -t "$IMAGE_URI" .
+          SKIP_PUSH=0
+        fi
+
+  post_build:
+    on-failure: ABORT
+    commands:
+      - if [ "$SKIP_PUSH" = "0" ]; then docker push "$IMAGE_URI"; fi
+      - printf '{"ImageURI":"%s"}' "$IMAGE_URI" > imageDetail.json
+      - python3 scripts/render-template.py ecs/taskdef.json taskdef.json --require "<IMAGE1_NAME>"
+      - python3 scripts/render-template.py ecs/appspec.yaml appspec.yaml --require "<TASK_DEFINITION>"
+      - cat imageDetail.json appspec.yaml
+
+artifacts:
+  files:
+    - imageDetail.json
+    - taskdef.json
+    - appspec.yaml

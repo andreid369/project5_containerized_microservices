@@ -1,0 +1,51 @@
+{
+  "family": "product-service",
+  "requiresCompatibilities": ["FARGATE"],
+  "networkMode": "awsvpc",
+  "cpu": "256",
+  "memory": "512",
+  "runtimePlatform": {
+    "operatingSystemFamily": "LINUX",
+    "cpuArchitecture": "X86_64"
+  },
+  "executionRoleArn": "${EXECUTION_ROLE_ARN}",
+  "taskRoleArn": "${TASK_ROLE_ARN}",
+  "containerDefinitions": [
+    {
+      "name": "product-service",
+      "image": "<IMAGE1_NAME>",
+      "essential": true,
+      "readonlyRootFilesystem": true,
+      "stopTimeout": 30,
+      "portMappings": [
+        { "name": "http", "containerPort": 3000, "protocol": "tcp" }
+      ],
+      "environment": [
+        { "name": "PORT", "value": "3000" },
+        { "name": "NODE_ENV", "value": "production" },
+        { "name": "AWS_REGION", "value": "${AWS_REGION}" },
+        { "name": "DB_HOST", "value": "${DB_HOST}" },
+        { "name": "DB_PORT", "value": "${DB_PORT}" },
+        { "name": "DB_NAME", "value": "products" },
+        { "name": "DB_SECRET_ARN", "value": "${DB_SECRET_ARN}" },
+        { "name": "DB_SSL", "value": "true" },
+        { "name": "RUN_MIGRATIONS", "value": "true" }
+      ],
+      "healthCheck": {
+        "command": ["CMD", "node", "src/healthcheck.js"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 30
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "${LOG_GROUP}",
+          "awslogs-region": "${AWS_REGION}",
+          "awslogs-stream-prefix": "app"
+        }
+      }
+    }
+  ]
+}

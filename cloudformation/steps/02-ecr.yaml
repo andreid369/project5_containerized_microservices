@@ -1,0 +1,52 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Product Service - Step 2: ECR repository"
+
+# Generated from cloudformation/product-service.yaml by scripts/render-cfn-steps.py.
+# Do not edit by hand.
+
+
+Resources:
+  # ==========================================================================
+  # Step 2: ECR repository
+  # ==========================================================================
+  EcrRepository:
+    Type: AWS::ECR::Repository
+    # Images outlive the stack. Delete with: aws ecr delete-repository --repository-name product-service --force
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: product-service
+      # Immutable tags: a tag always means the same image, so a deployment or a
+      # rollback to a tag is exact. Push a new tag (version or git SHA) per build.
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images after 7 days",
+                "selection": { "tagStatus": "untagged", "countType": "sinceImagePushed", "countUnit": "days", "countNumber": 7 },
+                "action": { "type": "expire" }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Keep the 30 most recent images",
+                "selection": { "tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 30 },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+      Tags:
+        - { Key: Project, Value: product-service }
+
+Outputs:
+  RepositoryUri:
+    Description: ECR repository URI (docker tag/push target)
+    Value: !GetAtt EcrRepository.RepositoryUri
+  RepositoryArn:
+    Value: !GetAtt EcrRepository.Arn

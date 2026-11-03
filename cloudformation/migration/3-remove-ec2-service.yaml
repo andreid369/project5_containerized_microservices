@@ -1,0 +1,865 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Product Service - Migration 3: all traffic on Fargate, EC2 service removed (EC2 capacity is removed by step 4)"
+
+# Generated from cloudformation/product-service.yaml by scripts/render-cfn-steps.py.
+# Do not edit by hand.
+
+Parameters:
+  ImageTag:
+    Type: String
+    Default: "1.0.0"
+    Description: Image tag pushed to ECR in step 2. Used for the CloudFormation-managed task definitions only; after step 6 the pipeline deploys commit-SHA tags.
+  DbInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+    AllowedValues: [db.t4g.micro, db.t4g.small, db.t4g.medium]
+  DbMasterUsername:
+    Type: String
+    Default: productadmin
+    AllowedPattern: "^[a-zA-Z][a-zA-Z0-9_]{1,15}$"
+    Description: RDS master username. The password is generated and kept in Secrets Manager, never in a parameter.
+  AlbIngressCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: "^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+    Description: Who may reach the public load balancer on port 80. Use your own IP (x.x.x.x/32) to keep the demo private.
+  MinTasks:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    Description: Minimum (and initial) number of tasks. Two spreads them across both availability zones.
+  MaxTasks:
+    Type: Number
+    Default: 4
+    MinValue: 1
+  Ec2InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues: [t3.small, t3.medium, m6i.large]
+    Description: Container instance type for the EC2 launch type baseline.
+  EcsAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ecs/optimized-ami/amazon-linux-2023/recommended/image_id
+    Description: Latest ECS-optimized Amazon Linux 2023 AMI, resolved from the public SSM parameter.
+
+Resources:
+  # ==========================================================================
+  # Step 2: ECR repository
+  # ==========================================================================
+  EcrRepository:
+    Type: AWS::ECR::Repository
+    # Images outlive the stack. Delete with: aws ecr delete-repository --repository-name product-service --force
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: product-service
+      # Immutable tags: a tag always means the same image, so a deployment or a
+      # rollback to a tag is exact. Push a new tag (version or git SHA) per build.
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images after 7 days",
+                "selection": { "tagStatus": "untagged", "countType": "sinceImagePushed", "countUnit": "days", "countNumber": 7 },
+                "action": { "type": "expire" }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Keep the 30 most recent images",
+                "selection": { "tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 30 },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+      Tags:
+        - { Key: Project, Value: product-service }
+
+  # ==========================================================================
+  # Step 3: networking
+  # Two availability zones. Public subnets hold the ALB and the NAT gateway;
+  # private subnets hold the tasks (or container instances) and the database.
+  # ==========================================================================
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: product-service-vpc }
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - { Key: Name, Value: product-service-igw }
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - { Key: Name, Value: product-service-public-a }
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - { Key: Name, Value: product-service-public-b }
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - { Key: Name, Value: product-service-private-a }
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - { Key: Name, Value: product-service-private-b }
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: product-service-public }
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteTable:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteTable:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # One NAT gateway to keep the cost down (about $0.045/hour). For production,
+  # use one per availability zone so losing a zone doesn't cut off the other.
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags:
+        - { Key: Name, Value: product-service-nat }
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: product-service-private }
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetARouteTable:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRouteTable:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  # Free gateway endpoint: ECR image layers are stored in S3, so layer
+  # downloads skip the NAT gateway (and its per-GB charge).
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref PrivateRouteTable]
+
+  # --------------------------------------------------------------------------
+  # Security groups. Each layer accepts traffic only from the layer in front:
+  # internet -> ALB (80) -> app (3000) -> database (5432).
+  # Cross-references are separate Ingress/Egress resources to avoid cycles.
+  # --------------------------------------------------------------------------
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Product Service database
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        # The database never initiates connections. A rule to localhost replaces
+        # the default allow-all egress rule, which leaves no outbound access.
+        - Description: No outbound traffic
+          IpProtocol: "-1"
+          CidrIp: 127.0.0.1/32
+      Tags:
+        - { Key: Name, Value: product-service-db }
+
+  # Fargate (awsvpc): every task has its own network interface and this
+  # security group, so rules apply per task, not per host.
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Product Service tasks
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - Description: HTTPS to AWS APIs (ECR, Secrets Manager, CloudWatch Logs) through the NAT gateway
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - { Key: Name, Value: product-service-app }
+
+  AppEgressToDatabase:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AppSecurityGroup
+      Description: PostgreSQL to the database only
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      DestinationSecurityGroupId: !Ref DbSecurityGroup
+
+  DbIngressFromApp:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DbSecurityGroup
+      Description: PostgreSQL from the Product Service tasks only
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref AppSecurityGroup
+
+  # ==========================================================================
+  # Step 3: database (Amazon RDS for PostgreSQL)
+  # ==========================================================================
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for the Product Service database
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    # A final snapshot is taken when the stack is deleted. Delete it by hand
+    # when you no longer need it (it costs storage).
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      Engine: postgres
+      EngineVersion: "18"
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: "20"
+      MaxAllocatedStorage: 50
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: products
+      MasterUsername: !Ref DbMasterUsername
+      # RDS generates the password, stores it in Secrets Manager and rotates it.
+      ManageMasterUserPassword: true
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref DbSecurityGroup]
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 7
+      CopyTagsToSnapshot: true
+      AutoMinorVersionUpgrade: true
+      DeletionProtection: false
+      Tags:
+        - { Key: Project, Value: product-service }
+
+  # ==========================================================================
+  # Step 3: ECS cluster, capacity providers, IAM roles, logs
+  # ==========================================================================
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: product-service
+      ClusterSettings:
+        # Container Insights publishes task counts (DesiredTaskCount etc.) and
+        # per-service CPU/memory, used by the dashboard in step 5.
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - { Key: Project, Value: product-service }
+
+  # Parallel run: EC2 stays for the EC2 service (which names its own strategy),
+  # and the default switches to FARGATE for the new Fargate service.
+  # It stays associated in the drain phase too: ECS won't remove a capacity
+  # provider from the cluster while a service still uses it, so the EC2
+  # service is deleted first (drain) and the provider after (step 4).
+  ClusterCapacityProviders:
+    Type: AWS::ECS::ClusterCapacityProviderAssociations
+    Properties:
+      Cluster: !Ref Cluster
+      CapacityProviders: [!Ref Ec2CapacityProvider, FARGATE]
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/product-service
+      RetentionInDays: 14
+
+  # Task role: used by the application itself, on EC2 and on Fargate. One
+  # permission: read the one database secret.
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Product Service application role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:*"
+      Policies:
+        - PolicyName: read-database-secret
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !GetAtt Database.MasterUserSecret.SecretArn
+
+  # Execution role: used by ECS to pull the image and write logs. Fargate has
+  # no container instance (and no instance role), so this role is required.
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: ECS agent role for the Product Service (image pull, logs)
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+
+  # Fargate task definition. After step 6 the pipeline registers new revisions
+  # of the same family from ecs/taskdef.json, which is then the source of
+  # truth. Keep the two in sync if you change one.
+  #
+  # No credentials anywhere in it: DB_SECRET_ARN is only the secret's ARN, and
+  # the application reads the username and password from Secrets Manager at
+  # runtime with the task role.
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: product-service
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      # Fargate needs task-level CPU and memory from the supported combinations.
+      Cpu: "256"
+      Memory: "512"
+      RuntimePlatform:
+        OperatingSystemFamily: LINUX
+        CpuArchitecture: X86_64
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: product-service
+          Image: !Sub "${EcrRepository.RepositoryUri}:${ImageTag}"
+          Essential: true
+          ReadonlyRootFilesystem: true
+          StopTimeout: 30
+          PortMappings:
+            - Name: http
+              ContainerPort: 3000
+              Protocol: tcp
+          Environment:
+            - { Name: PORT, Value: "3000" }
+            - { Name: NODE_ENV, Value: production }
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+            - { Name: DB_HOST, Value: !GetAtt Database.Endpoint.Address }
+            - { Name: DB_PORT, Value: !GetAtt Database.Endpoint.Port }
+            - { Name: DB_NAME, Value: products }
+            - { Name: DB_SECRET_ARN, Value: !GetAtt Database.MasterUserSecret.SecretArn }
+            - { Name: DB_SSL, Value: "true" }
+            - { Name: RUN_MIGRATIONS, Value: "true" }
+          HealthCheck:
+            Command: ["CMD", "node", "src/healthcheck.js"]
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 30
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref AppLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: app
+
+  # ==========================================================================
+  # Migration: EC2 launch type baseline (the "before" state)
+  # Container instances in an Auto Scaling group, registered as an ECS
+  # capacity provider. Bridge networking with dynamic host ports, an
+  # instance-type target group, and an instance role that pulls images and
+  # writes logs for every task on the host.
+  # ==========================================================================
+  Ec2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: ECS container instance role (EC2 baseline only)
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Register with the cluster, pull from ECR, write task logs.
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role"
+        # Shell access through Session Manager instead of SSH and open ports.
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+
+  Ec2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref Ec2InstanceRole]
+
+  # Bridge networking: tasks share the host's network interface, so security
+  # rules apply to the instance, not to the task.
+  Ec2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Product Service ECS container instances (EC2 baseline)
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - Description: HTTPS to AWS APIs (ECS, ECR, Secrets Manager, CloudWatch Logs, SSM)
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - { Key: Name, Value: product-service-ec2 }
+
+  Ec2EgressToDatabase:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref Ec2SecurityGroup
+      Description: PostgreSQL to the database only
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      DestinationSecurityGroupId: !Ref DbSecurityGroup
+
+  DbIngressFromEc2:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DbSecurityGroup
+      Description: PostgreSQL from the container instances (EC2 baseline)
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref Ec2SecurityGroup
+
+  Ec2LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref EcsAmiId
+        InstanceType: !Ref Ec2InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt Ec2InstanceProfile.Arn
+        SecurityGroupIds: [!Ref Ec2SecurityGroup]
+        MetadataOptions:
+          # IMDSv2 only, and a hop limit of 1 so containers in bridge mode
+          # (one network hop away) can't read the instance role's credentials.
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+          HttpEndpoint: enabled
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 30
+              VolumeType: gp3
+              Encrypted: true
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            cat >> /etc/ecs/ecs.config <<'EOF'
+            ECS_CLUSTER=${Cluster}
+            ECS_CONTAINER_STOP_TIMEOUT=30s
+            ECS_ENABLE_TASK_IAM_ROLE=true
+            EOF
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Name, Value: product-service-ecs-instance }
+
+  Ec2AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref Ec2LaunchTemplate
+        Version: !GetAtt Ec2LaunchTemplate.LatestVersionNumber
+      # Two instances, one per zone. The capacity provider adds instances when
+      # tasks don't fit (managed scaling), up to MaxSize.
+      MinSize: "2"
+      MaxSize: "4"
+      HealthCheckType: EC2
+      Tags:
+        - Key: AmazonECSManaged
+          Value: "true"
+          PropagateAtLaunch: true
+
+  Ec2CapacityProvider:
+    Type: AWS::ECS::CapacityProvider
+    Properties:
+      AutoScalingGroupProvider:
+        AutoScalingGroupArn: !Ref Ec2AutoScalingGroup
+        ManagedScaling:
+          Status: ENABLED
+          TargetCapacity: 100
+        # Termination protection off keeps stack updates and deletes simple;
+        # managed draining moves tasks off an instance before it is terminated.
+        ManagedTerminationProtection: DISABLED
+        ManagedDraining: ENABLED
+
+  # EC2 task definition: bridge networking, dynamic host port (HostPort 0),
+  # container-level CPU and memory, and no execution role (the instance role
+  # pulls the image and writes the logs).
+  Ec2TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: product-service-ec2
+      RequiresCompatibilities: [EC2]
+      NetworkMode: bridge
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: product-service
+          Image: !Sub "${EcrRepository.RepositoryUri}:${ImageTag}"
+          Essential: true
+          Cpu: 256
+          Memory: 512
+          MemoryReservation: 256
+          ReadonlyRootFilesystem: true
+          StopTimeout: 30
+          PortMappings:
+            - ContainerPort: 3000
+              HostPort: 0
+              Protocol: tcp
+          Environment:
+            - { Name: PORT, Value: "3000" }
+            - { Name: NODE_ENV, Value: production }
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+            - { Name: DB_HOST, Value: !GetAtt Database.Endpoint.Address }
+            - { Name: DB_PORT, Value: !GetAtt Database.Endpoint.Port }
+            - { Name: DB_NAME, Value: products }
+            - { Name: DB_SECRET_ARN, Value: !GetAtt Database.MasterUserSecret.SecretArn }
+            - { Name: DB_SSL, Value: "true" }
+            - { Name: RUN_MIGRATIONS, Value: "true" }
+          HealthCheck:
+            Command: ["CMD", "node", "src/healthcheck.js"]
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 30
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref AppLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: app-ec2
+
+  # ==========================================================================
+  # Step 4: Application Load Balancer
+  # ==========================================================================
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Product Service load balancer
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - Description: HTTP from the allowed range
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref AlbIngressCidr
+      SecurityGroupEgress:
+        # Replaces the default allow-all rule; the real targets are added by
+        # the AlbEgressTo* resources below.
+        - Description: No outbound traffic except the rules below
+          IpProtocol: "-1"
+          CidrIp: 127.0.0.1/32
+      Tags:
+        - { Key: Name, Value: product-service-alb }
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroups: [!Ref AlbSecurityGroup]
+      LoadBalancerAttributes:
+        - Key: routing.http.drop_invalid_header_fields.enabled
+          Value: "true"
+        - Key: idle_timeout.timeout_seconds
+          Value: "60"
+      Tags:
+        - { Key: Project, Value: product-service }
+
+  # EC2 baseline: instance targets on dynamic host ports (32768-65535).
+  AlbEgressToEc2:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AlbSecurityGroup
+      Description: To container instances on the dynamic host port range
+      IpProtocol: tcp
+      FromPort: 32768
+      ToPort: 65535
+      DestinationSecurityGroupId: !Ref Ec2SecurityGroup
+
+  Ec2IngressFromAlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref Ec2SecurityGroup
+      Description: Dynamic host ports from the load balancer only
+      IpProtocol: tcp
+      FromPort: 32768
+      ToPort: 65535
+      SourceSecurityGroupId: !Ref AlbSecurityGroup
+
+  TargetGroupEc2:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref Vpc
+      TargetType: instance
+      Protocol: HTTP
+      Port: 3000 # ignored for ECS dynamic ports; each target registers its own host port
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: { HttpCode: "200" }
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+
+  # Fargate: IP targets (each task's own address) on the container port.
+  AlbEgressToApp:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AlbSecurityGroup
+      Description: To the Product Service tasks only
+      IpProtocol: tcp
+      FromPort: 3000
+      ToPort: 3000
+      DestinationSecurityGroupId: !Ref AppSecurityGroup
+
+  AppIngressFromAlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AppSecurityGroup
+      Description: Port 3000 from the load balancer only
+      IpProtocol: tcp
+      FromPort: 3000
+      ToPort: 3000
+      SourceSecurityGroupId: !Ref AlbSecurityGroup
+
+  # "Blue" target group: production traffic starts here. CodeDeploy (step 6)
+  # alternates production between this and the green target group.
+  TargetGroupBlue:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref Vpc
+      TargetType: ip
+      Protocol: HTTP
+      Port: 3000
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: { HttpCode: "200" }
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroupBlue
+
+  # ==========================================================================
+  # Step 4: ECS service on Fargate
+  # ==========================================================================
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: [HttpListener, ClusterCapacityProviders, TaskDefinition]
+    Properties:
+      ServiceName: product-service
+      Cluster: !Ref Cluster
+      # The task definition FAMILY, not !Ref TaskDefinition. ECS resolves it to
+      # the latest revision when the service is created (hence the DependsOn).
+      # After that the value never changes, so a new revision registered by
+      # CloudFormation (step 8) or by the pipeline never makes CloudFormation
+      # call UpdateService with a task definition, which ECS rejects for a
+      # CODE_DEPLOY service. New revisions reach the service via CodeDeploy.
+      TaskDefinition: product-service
+      # No LaunchType and no CapacityProviderStrategy: the service is created
+      # with the cluster's default strategy (FARGATE). With the CODE_DEPLOY
+      # controller, later changes to where tasks run arrive with each CodeDeploy
+      # deployment (AppSpec CapacityProviderStrategy, step 7), so this resource
+      # never has to change, which CloudFormation couldn't do on this service.
+      PlatformVersion: LATEST
+      DesiredCount: !Ref MinTasks
+      # The deployment controller is chosen when the service is created. It is
+      # CODE_DEPLOY from the start so step 6 can add blue/green deployments
+      # without replacing or migrating the service. Consequence: between steps
+      # 4 and 6, new images are deployed by the pipeline only (see README).
+      DeploymentController:
+        Type: CODE_DEPLOY
+      HealthCheckGracePeriodSeconds: 60
+      EnableECSManagedTags: true
+      PropagateTags: SERVICE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+          SecurityGroups: [!Ref AppSecurityGroup]
+      LoadBalancers:
+        - ContainerName: product-service
+          ContainerPort: 3000
+          TargetGroupArn: !Ref TargetGroupBlue
+
+  # ==========================================================================
+  # Step 4: Auto Scaling (target tracking)
+  # Scaling is on CPU and memory, not on ALB requests per target: the request
+  # metric is tied to one target group, and blue/green swaps the target group
+  # on every deployment, which would leave that policy reading the idle one.
+  # ==========================================================================
+  ScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      ServiceNamespace: ecs
+      ScalableDimension: ecs:service:DesiredCount
+      ResourceId: !Sub "service/${Cluster}/${Service.Name}"
+      MinCapacity: !Ref MinTasks
+      MaxCapacity: !Ref MaxTasks
+      # No RoleARN: Application Auto Scaling uses its service-linked role.
+
+  CpuScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: product-service-cpu-60
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 60
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleOutCooldown: 60
+        ScaleInCooldown: 300
+
+  MemoryScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: product-service-memory-75
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 75
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageMemoryUtilization
+        ScaleOutCooldown: 60
+        ScaleInCooldown: 300
+
+Outputs:
+  RepositoryUri:
+    Description: ECR repository URI (docker tag/push target)
+    Value: !GetAtt EcrRepository.RepositoryUri
+  RepositoryArn:
+    Value: !GetAtt EcrRepository.Arn
+  ClusterName:
+    Value: !Ref Cluster
+  PrivateSubnetIds:
+    Value: !Sub "${PrivateSubnetA},${PrivateSubnetB}"
+  LogGroupName:
+    Value: !Ref AppLogGroup
+  DatabaseEndpoint:
+    Value: !GetAtt Database.Endpoint.Address
+  DatabaseSecretArn:
+    Description: RDS-managed secret holding the database password
+    Value: !GetAtt Database.MasterUserSecret.SecretArn
+  TaskDefinitionArn:
+    Description: Fargate task definition (for aws ecs run-task in step 3)
+    Value: !Ref TaskDefinition
+  AppSecurityGroupId:
+    Value: !Ref AppSecurityGroup
+  LoadBalancerDnsName:
+    Value: !GetAtt LoadBalancer.DNSName
+  ProductsUrl:
+    Description: The public endpoint
+    Value: !Sub "http://${LoadBalancer.DNSName}/products"
+  ServiceName:
+    Value: !GetAtt Service.Name
+  Ec2AutoScalingGroupName:
+    Value: !Ref Ec2AutoScalingGroup

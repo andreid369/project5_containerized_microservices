@@ -1,0 +1,25 @@
+# CodeDeploy AppSpec template for the ECS blue/green deployment.
+#
+# CodeBuild renders this into appspec.yaml (scripts/render-template.py):
+#   ${CAPACITY_PROVIDER_STRATEGY_JSON} comes from the CloudFormation stack
+#   (CodeBuild environment variable), so every deployment uses the strategy
+#   the stack defines: FARGATE only in step 6, FARGATE + FARGATE_SPOT from
+#   step 7. A blue/green service takes its capacity settings from the
+#   deployment, not from CloudFormation.
+#   <TASK_DEFINITION> is left for CodePipeline, which replaces it with the
+#   task definition revision it registers from taskdef.json.
+version: 0.0
+Resources:
+  - TargetService:
+      Type: AWS::ECS::Service
+      Properties:
+        TaskDefinition: <TASK_DEFINITION>
+        LoadBalancerInfo:
+          ContainerName: product-service
+          ContainerPort: 3000
+        PlatformVersion: LATEST
+        CapacityProviderStrategy: ${CAPACITY_PROVIDER_STRATEGY_JSON}
+# Optional: add lifecycle hooks (Lambda functions) for automated tests against
+# the test listener before traffic shifts, for example:
+# Hooks:
+#   - AfterAllowTestTraffic: "arn:aws:lambda:REGION:ACCOUNT:function:product-service-smoke-test"

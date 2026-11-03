@@ -1,0 +1,12 @@
+node_modules/
+npm-debug.log*
+coverage/
+.env
+.env.*
+!.env.example
+*.pem
+!certs/.gitkeep
+# build outputs written by CodeBuild
+/imageDetail.json
+/taskdef.json
+/appspec.yaml
