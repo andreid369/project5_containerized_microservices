@@ -1,0 +1,178 @@
+# Continuous integration: checks every pull request and every push to main.
+#
+# This workflow only verifies. It has no AWS credentials and deploys nothing:
+# deployment is CodePipeline's job (CodeBuild -> ECR -> CodeDeploy blue/green),
+# which starts on every push to main. Protect main so a change can only reach it
+# through a pull request with these checks green (see README, "CI on GitHub").
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm test
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+  docker:
+    name: Docker build and smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_DB: products
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d products"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+
+      # The same test stage CodeBuild runs before every deployment.
+      - name: Build test stage (runs npm test inside the image)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: test
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The runtime image. Its build also fails if the node user can't read
+      # the RDS certificate bundle (see the Dockerfile).
+      - name: Build runtime image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: product-service:ci
+          cache-from: type=gha
+
+      - name: Check the image
+        run: |
+          set -euo pipefail
+          uid=$(docker run --rm --entrypoint id product-service:ci -u)
+          [ "$uid" != "0" ] || { echo "image runs as root"; exit 1; }
+          echo "runs as uid $uid"
+          if docker run --rm --entrypoint sh product-service:ci -c 'command -v npm'; then
+            echo "npm is present in the runtime image"; exit 1
+          fi
+          echo "no npm in the runtime image"
+          docker image ls product-service:ci --format 'size: {{.Size}}'
+
+      # Run the image as ECS does: read-only root filesystem, real PostgreSQL.
+      - name: Start the service
+        run: |
+          docker run -d --name app --network host --read-only \
+            -e PORT=3000 -e DB_HOST=127.0.0.1 -e DB_PORT=5432 -e DB_NAME=products \
+            -e DB_USER=postgres -e DB_PASSWORD=ci-only -e DB_SSL=false \
+            product-service:ci
+
+      - name: Smoke test
+        run: scripts/smoke-test.sh http://127.0.0.1:3000
+
+      - name: Restart keeps the data and skips the seed
+        run: |
+          set -euo pipefail
+          docker restart app
+          WAIT_SECONDS=30 scripts/smoke-test.sh http://127.0.0.1:3000
+          [ "$(docker logs app 2>&1 | grep -c 'seeded products table')" = "1" ] \
+            || { echo "the seed ran more than once"; exit 1; }
+
+      - name: Graceful shutdown on SIGTERM
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          docker stop --time 20 app
+          took=$(( $(date +%s) - start ))
+          code=$(docker inspect app --format '{{.State.ExitCode}}')
+          echo "stopped in ${took}s with exit code $code"
+          [ "$code" = "0" ] || { echo "non-zero exit on SIGTERM"; exit 1; }
+          [ "$took" -lt 10 ] || { echo "shutdown took too long"; exit 1; }
+          docker logs app 2>&1 | grep -q '"shutting down"' || { echo "no shutdown log line"; exit 1; }
+
+      - name: Service logs
+        if: always()
+        run: docker logs app 2>&1 || true
+
+  templates:
+    name: CloudFormation and pipeline files
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: pip install cfn-lint pyyaml
+
+      - name: Generated templates are up to date
+        run: |
+          python3 scripts/render-cfn-steps.py
+          git diff --exit-code -- cloudformation/ \
+            || { echo "::error::cloudformation/steps or migration are out of date. Run scripts/render-cfn-steps.py and commit."; exit 1; }
+
+      - name: cfn-lint
+        run: cfn-lint cloudformation/steps/*.yaml cloudformation/migration/*.yaml
+
+      - name: Render taskdef.json and appspec.yaml like CodeBuild does
+        env:
+          EXECUTION_ROLE_ARN: arn:aws:iam::111122223333:role/ci-exec
+          TASK_ROLE_ARN: arn:aws:iam::111122223333:role/ci-task
+          AWS_REGION: us-east-1
+          DB_HOST: db.example.internal
+          DB_PORT: "5432"
+          DB_SECRET_ARN: arn:aws:secretsmanager:us-east-1:111122223333:secret:product-service/database
+          LOG_GROUP: /ecs/product-service
+          CAPACITY_PROVIDER_STRATEGY_JSON: '[{"CapacityProvider": "FARGATE", "Base": 1, "Weight": 1}, {"CapacityProvider": "FARGATE_SPOT", "Base": 0, "Weight": 3}]'
+        run: |
+          set -euo pipefail
+          python3 scripts/render-template.py ecs/taskdef.json "$RUNNER_TEMP/taskdef.json" --require "<IMAGE1_NAME>"
+          python3 scripts/render-template.py ecs/appspec.yaml "$RUNNER_TEMP/appspec.yaml" --require "<TASK_DEFINITION>"
+          python3 - "$RUNNER_TEMP/appspec.yaml" <<'EOF'
+          import sys, yaml
+          spec = yaml.safe_load(open(sys.argv[1]))
+          props = spec["Resources"][0]["TargetService"]["Properties"]
+          assert props["CapacityProviderStrategy"][0]["CapacityProvider"] == "FARGATE", props
+          print("appspec.yaml renders with", props["CapacityProviderStrategy"])
+          EOF
+          python3 -c "import yaml; yaml.safe_load(open('buildspec.yml')); print('buildspec.yml is valid YAML')"
+
+      - name: The task definition holds no credentials
+        run: |
+          if grep -nE '"name": *"DB_(USER|PASSWORD)"' ecs/taskdef.json; then
+            echo "::error::credentials must come from Secrets Manager, not task definition environment variables"; exit 1
+          fi
+          echo "no DB_USER or DB_PASSWORD in ecs/taskdef.json"
