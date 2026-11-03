@@ -44,7 +44,10 @@ RUN rm -rf /usr/local/lib/node_modules /usr/local/bin/npm /usr/local/bin/npx \
 WORKDIR /app
 
 # AWS RDS certificate bundle, used to verify the database's TLS certificate.
-ADD --chmod=444 https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem /app/certs/rds-global-bundle.pem
+# Files ADDed from a URL are created root-only (0600), and some Docker versions
+# ignore ADD --chmod for URLs, so the permissions are set explicitly here.
+ADD https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem /app/certs/rds-global-bundle.pem
+RUN chmod 755 /app/certs && chmod 444 /app/certs/rds-global-bundle.pem
 
 # Application files are owned by root and only readable by the node user, so a
 # compromised process can't modify its own code.
@@ -53,6 +56,12 @@ COPY package.json ./
 COPY src ./src
 
 USER node
+
+# Fail the build, not the deployment, if the app user can't read its CA bundle
+# or the bundle isn't a usable certificate.
+RUN node -e "const fs=require('fs'),{X509Certificate}=require('crypto'); \
+  new X509Certificate(fs.readFileSync(process.env.DB_SSL_CA_PATH)); console.log('CA bundle readable by', require('os').userInfo().username)"
+
 EXPOSE 3000
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=15s --retries=3 \
