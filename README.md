@@ -59,11 +59,15 @@ product-service/
 ├── ecs/
 │   ├── taskdef.json      # task definition template the pipeline registers
 │   └── appspec.yaml      # CodeDeploy AppSpec template (blue/green target + capacity provider strategy)
+├── .github/
+│   ├── workflows/ci.yml  # GitHub Actions: pull request checks (tests, Docker smoke test, templates)
+│   └── dependabot.yml    # weekly dependency update pull requests
 ├── docs/
 │   └── EC2_to_Fargate_Migration.md
 └── scripts/
     ├── render-cfn-steps.py   # regenerate cloudformation/steps/ and migration/ from the source
-    └── render-template.py    # fill ecs/taskdef.json and ecs/appspec.yaml from CodeBuild variables
+    ├── render-template.py    # fill ecs/taskdef.json and ecs/appspec.yaml from CodeBuild variables
+    └── smoke-test.sh         # endpoint checks against a running service (local, CI or the AWS load balancer)
 ```
 
 ## Step 1: the service and the Docker image
@@ -269,7 +273,37 @@ curl "$(out TestListenerUrl)"
 curl "$(out ProductsUrl)"
 ```
 
-**Try a rollback:** change `GET /products` to return a 500, push, and watch the alarm stop the deployment and CodeDeploy shift traffic back to blue.
+**Try a rollback:** in `src/products.js`, change `FROM products` to `FROM productz`. The unit tests don't cover the SQL and `/health` still passes, so the change deploys and traffic switches. Push, keep requesting `/products`, and watch the 5XX alarm stop the deployment and CodeDeploy shift traffic back to blue. Then `git revert HEAD && git push`.
+
+## CI on GitHub: pull request checks
+
+`.github/workflows/ci.yml` checks every pull request and every push to `main`. It needs no AWS credentials and deploys nothing; CodePipeline stays the only path to AWS. The two meet at `main`: CI decides what may be merged, and CodePipeline deploys what is merged.
+
+| Check (job name) | What it runs | What it catches |
+|---|---|---|
+| Unit tests | `npm ci`, `npm test`, `npm audit --omit=dev --audit-level=high` | Broken code, vulnerable production dependencies |
+| Docker build and smoke test | The Dockerfile's `test` stage, the runtime image (amd64), non-root and no-npm checks, then the image started read-only against a PostgreSQL service container: `scripts/smoke-test.sh`, a restart (no second seed), and a SIGTERM shutdown (exit 0 in under 10 s) | A Dockerfile that doesn't build or doesn't run, missing files, permission problems, a broken health check or shutdown |
+| CloudFormation and pipeline files | The generated templates match their source, `cfn-lint`, `taskdef.json` and `appspec.yaml` rendered as CodeBuild does, and no credential variables in the task definition | Templates edited without regenerating, template errors, a buildspec change that would fail in CodeBuild |
+
+`.github/dependabot.yml` opens weekly pull requests for npm packages, GitHub Actions and the base image. Each one runs through CI, and merging it deploys it.
+
+**Make the checks a gate.** Without branch protection CI only reports results, and a direct push to `main` still deploys. On GitHub, go to Settings → Rules → Rulesets → New branch ruleset, target the default branch, and enable:
+
+- **Require a pull request before merging** (0 approvals is fine when you work alone)
+- **Require status checks to pass**, adding the three job names above (they appear after the workflow has run once)
+- **Block force pushes**
+
+From then on the flow is: branch, then pull request, then CI, then merge, then CodePipeline, then a blue/green deployment.
+
+```bash
+git switch -c change-something
+# edit, commit
+git push -u origin change-something
+gh pr create --fill          # CI runs; merge when green
+gh pr merge --squash --delete-branch
+```
+
+`scripts/smoke-test.sh` also works against AWS: `scripts/smoke-test.sh "http://$(out LoadBalancerDnsName)"`.
 
 ## Step 7: Fargate and Fargate Spot capacity providers
 
