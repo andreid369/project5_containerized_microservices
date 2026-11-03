@@ -2,23 +2,7 @@
 
 A small Node.js REST API, `GET /products`, that reads products from Amazon RDS for PostgreSQL, packaged as a minimal non-root container and deployed to ECS Fargate behind an Application Load Balancer. All infrastructure is CloudFormation, built up in eight steps: the container registry, the database and cluster, the service with Auto Scaling, a dashboard, a CI/CD pipeline with CodeDeploy blue/green deployments, a Fargate + Fargate Spot capacity mix, and database credentials in a rotating Secrets Manager secret. A separate migration path shows the same service moving from the EC2 launch type to Fargate with no downtime.
 
-```mermaid
-flowchart LR
-  Dev["git push"] --> GH["GitHub"]
-  GH --> CP["CodePipeline"]
-  CP --> CB["CodeBuild<br/>test, build, push"]
-  CB --> ECR["ECR<br/>product-service"]
-  CP --> CD["CodeDeploy<br/>blue/green"]
-  CD -.->|"swaps listener"| ALB
-
-  C["Client"] -->|":80"| ALB["Application Load Balancer<br/>public subnets"]
-  ALB -->|":3000"| T["ECS tasks (2-4), private subnets<br/>Fargate base + Fargate Spot"]
-  T -->|":5432 TLS"| DB[("RDS PostgreSQL 18<br/>private, encrypted")]
-  T -.->|"GetSecretValue<br/>(task role)"| SM["Secrets Manager<br/>product-service/database<br/>rotated every 30 days"]
-  SM -.->|"rotation Lambda"| DB
-  T -.-> CW["CloudWatch Logs,<br/>Container Insights, dashboard"]
-  AS["Auto Scaling<br/>CPU 60%, memory 75%"] -.-> T
-```
+![Product Service architecture on AWS: users reach an Application Load Balancer in public subnets, which forwards to ECS tasks on Fargate and Fargate Spot in private subnets; the tasks read credentials from Secrets Manager and query RDS PostgreSQL; a rotation Lambda rotates the password; CodePipeline, CodeBuild and CodeDeploy deploy every merge to main with blue/green](docs/images/architecture.png)
 
 Security groups chain the layers: internet → ALB (80) → tasks (3000) → database (5432). Each accepts traffic only from the one in front of it.
 
@@ -63,7 +47,8 @@ product-service/
 │   ├── workflows/ci.yml  # GitHub Actions: pull request checks (tests, Docker smoke test, templates)
 │   └── dependabot.yml    # weekly dependency update pull requests
 ├── docs/
-│   └── EC2_to_Fargate_Migration.md
+│   ├── EC2_to_Fargate_Migration.md
+│   └── images/           # architecture.png (in this README), architecture.svg, src/ to regenerate them
 └── scripts/
     ├── render-cfn-steps.py   # regenerate cloudformation/steps/ and migration/ from the source
     ├── render-template.py    # fill ecs/taskdef.json and ecs/appspec.yaml from CodeBuild variables
