@@ -423,3 +423,9 @@ If re-creating the stack later fails because the secret name `product-service/da
 python3 scripts/render-cfn-steps.py
 pip install cfn-lint && cfn-lint cloudformation/steps/*.yaml cloudformation/migration/*.yaml
 ```
+
+## License
+
+[MIT](LICENSE): you may use, copy and modify this project, including commercially, as long as the copyright notice stays with it.
+
+The architecture diagram (`docs/images/architecture.png` and `.svg`) contains [AWS Architecture Icons](https://aws.amazon.com/architecture/icons/), which belong to Amazon Web Services and are used under AWS's terms for architecture diagrams. They are not covered by the MIT license.
