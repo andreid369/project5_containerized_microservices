@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "Product Service microservice: GET /products from Amazon RDS for PostgreSQL",
   "private": true,
+  "license": "MIT",
   "main": "src/server.js",
   "engines": {
     "node": ">=22"
